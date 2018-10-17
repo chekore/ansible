@@ -1,69 +1,70 @@
 # -*- coding: utf-8 -*-
-# (c) 2015, Toshio Kuratomi <tkuratomi@ansible.com>
-#
-# This file is part of Ansible
-#
-# Ansible is free software: you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
-# (at your option) any later version.
-#
-# Ansible is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License
-# along with Ansible.  If not, see <http://www.gnu.org/licenses/>.
+# (c) 2015-2017, Toshio Kuratomi <tkuratomi@ansible.com>
+# GNU General Public License v3.0+ (see COPYING or https://www.gnu.org/licenses/gpl-3.0.txt)
 
 # Make coding more python3-ish
 from __future__ import (absolute_import, division)
 __metaclass__ = type
 
-import sys
-import json
+from itertools import chain
+import pytest
 
-from ansible.compat.tests import unittest
-from units.mock.procenv import swap_stdin_and_argv
 
-class TestAnsibleModuleExitJson(unittest.TestCase):
+# Strings that should be converted into a typed value
+VALID_STRINGS = (
+    ("'a'", 'a'),
+    ("'1'", '1'),
+    ("1", 1),
+    ("True", True),
+    ("False", False),
+    ("{}", {}),
+)
 
-    def test_module_utils_basic_safe_eval(self):
-        from ansible.module_utils import basic
+# Passing things that aren't strings should just return the object
+NONSTRINGS = (
+    ({'a': 1}, {'a': 1}),
+)
 
-        args = json.dumps(dict(ANSIBLE_MODULE_ARGS={}, ANSIBLE_MODULE_CONSTANTS={}))
+# These strings are not basic types.  For security, these should not be
+# executed.  We return the same string and get an exception for some
+INVALID_STRINGS = (
+    ("a=1", "a=1", SyntaxError),
+    ("a.foo()", "a.foo()", None),
+    ("import foo", "import foo", None),
+    ("__import__('foo')", "__import__('foo')", ValueError),
+)
 
-        with swap_stdin_and_argv(stdin_data=args):
-            am = basic.AnsibleModule(
-                argument_spec=dict(),
-            )
 
-            # test some basic usage
-            # string (and with exceptions included), integer, bool
-            self.assertEqual(am.safe_eval("'a'"), 'a')
-            self.assertEqual(am.safe_eval("'a'", include_exceptions=True), ('a', None))
-            self.assertEqual(am.safe_eval("1"), 1)
-            self.assertEqual(am.safe_eval("True"), True)
-            self.assertEqual(am.safe_eval("False"), False)
-            self.assertEqual(am.safe_eval("{}"), {})
-            # not passing in a string to convert
-            self.assertEqual(am.safe_eval({'a':1}), {'a':1})
-            self.assertEqual(am.safe_eval({'a':1}, include_exceptions=True), ({'a':1}, None))
-            # invalid literal eval
-            self.assertEqual(am.safe_eval("a=1"), "a=1")
-            res = am.safe_eval("a=1", include_exceptions=True)
-            self.assertEqual(res[0], "a=1")
-            self.assertEqual(type(res[1]), SyntaxError)
-            self.assertEqual(am.safe_eval("a.foo()"), "a.foo()")
-            res = am.safe_eval("a.foo()", include_exceptions=True)
-            self.assertEqual(res[0], "a.foo()")
-            self.assertEqual(res[1], None)
-            self.assertEqual(am.safe_eval("import foo"), "import foo")
-            res = am.safe_eval("import foo", include_exceptions=True)
-            self.assertEqual(res[0], "import foo")
-            self.assertEqual(res[1], None)
-            self.assertEqual(am.safe_eval("__import__('foo')"), "__import__('foo')")
-            res = am.safe_eval("__import__('foo')", include_exceptions=True)
-            self.assertEqual(res[0], "__import__('foo')")
-            self.assertEqual(type(res[1]), ValueError)
+@pytest.mark.parametrize('code, expected, stdin',
+                         ((c, e, {}) for c, e in chain(VALID_STRINGS, NONSTRINGS)),
+                         indirect=['stdin'])
+def test_simple_types(am, code, expected):
+    # test some basic usage for various types
+    assert am.safe_eval(code) == expected
 
+
+@pytest.mark.parametrize('code, expected, stdin',
+                         ((c, e, {}) for c, e in chain(VALID_STRINGS, NONSTRINGS)),
+                         indirect=['stdin'])
+def test_simple_types_with_exceptions(am, code, expected):
+    # Test simple types with exceptions requested
+    assert am.safe_eval(code, include_exceptions=True), (expected, None)
+
+
+@pytest.mark.parametrize('code, expected, stdin',
+                         ((c, e, {}) for c, e, dummy in INVALID_STRINGS),
+                         indirect=['stdin'])
+def test_invalid_strings(am, code, expected):
+    assert am.safe_eval(code) == expected
+
+
+@pytest.mark.parametrize('code, expected, exception, stdin',
+                         ((c, e, ex, {}) for c, e, ex in INVALID_STRINGS),
+                         indirect=['stdin'])
+def test_invalid_strings_with_exceptions(am, code, expected, exception):
+    res = am.safe_eval(code, include_exceptions=True)
+    assert res[0] == expected
+    if exception is None:
+        assert res[1] == exception
+    else:
+        assert type(res[1]) == exception

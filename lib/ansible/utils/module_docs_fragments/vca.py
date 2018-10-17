@@ -22,62 +22,45 @@ class ModuleDocFragment(object):
 options:
     username:
       description:
-        - The vca username or email address, if not set the environment variable VCA_USER is checked for the username.
-      required: false
-      default: None
+        - The vca username or email address, if not set the environment variable C(VCA_USER) is checked for the username.
       aliases: ['user']
     password:
       description:
-        - The vca password, if not set the environment variable VCA_PASS is checked for the password
-      required: false
-      default: None
-      aliases: ['pass', 'pwd']
+        - The vca password, if not set the environment variable C(VCA_PASS) is checked for the password.
+      aliases: ['pass', 'passwd']
     org:
       description:
-        - The org to login to for creating vapp, mostly set when the service_type is vdc.
-      required: false
-      default: None
+        - The org to login to for creating vapp. This option is required when the C(service_type) is I(vdc).
     instance_id:
       description:
-        - The instance id in a vchs environment to be used for creating the vapp
-      required: false
-      default: None
+        - The instance id in a vchs environment to be used for creating the vapp.
     host:
       description:
-        - The authentication host to be used when service type  is vcd.
-      required: false
-      default: None
+        - The authentication host to be used when service type is vcd.
     api_version:
       description:
-        - The api version to be used with the vca
-      required: false
+        - The api version to be used with the vca.
       default: "5.7"
     service_type:
       description:
-        - The type of service we are authenticating against
-      required: false
+        - The type of service we are authenticating against.
       default: vca
       choices: [ "vca", "vchs", "vcd" ]
     state:
       description:
-        - if the object should be added or removed
-      required: false
+        - If the object should be added or removed.
       default: present
       choices: [ "present", "absent" ]
     verify_certs:
       description:
-        - If the certificates of the authentication is to be verified
-      required: false
-      default: True
+        - If the certificates of the authentication is to be verified.
+      type: bool
+      default: 'yes'
     vdc_name:
       description:
         - The name of the vdc where the gateway is located.
-      required: false
-      default: None
     gateway_name:
       description:
-        - The name of the gateway of the vdc where the rule should be added
-      required: false
+        - The name of the gateway of the vdc where the rule should be added.
       default: gateway
 """
-

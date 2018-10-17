@@ -1,4 +1,4 @@
-#!/usr/bin/python
+#!/usr/bin/env python
 #
 # Copyright (c) 2016 Matt Davis, <mdavis@ansible.com>
 #                    Chris Houseknecht, <house@redhat.com>
@@ -23,8 +23,8 @@
 Azure External Inventory Script
 ===============================
 Generates dynamic inventory by making API requests to the Azure Resource
-Manager using the AAzure Python SDK. For instruction on installing the
-Azure Python SDK see http://azure-sdk-for-python.readthedocs.org/
+Manager using the Azure Python SDK. For instruction on installing the
+Azure Python SDK see https://azure-sdk-for-python.readthedocs.io/
 
 Authentication
 --------------
@@ -32,7 +32,7 @@ The order of precedence is command line arguments, environment variables,
 and finally the [default] profile found in ~/.azure/credentials.
 
 If using a credentials file, it should be an ini formatted file with one or
-more sections, which we refer to as profiles. The script looks for a 
+more sections, which we refer to as profiles. The script looks for a
 [default] section, if a profile is not specified either on the command line
 or with an environment variable. The keys in a profile will match the
 list of command line arguments below.
@@ -42,13 +42,15 @@ in your ~/.azure/credentials file, or a service principal or Active Directory
 user.
 
 Command line arguments:
- - profile 
+ - profile
  - client_id
  - secret
  - subscription_id
  - tenant
  - ad_user
  - password
+ - cloud_environment
+ - adfs_authority_url
 
 Environment variables:
  - AZURE_PROFILE
@@ -58,10 +60,12 @@ Environment variables:
  - AZURE_TENANT
  - AZURE_AD_USER
  - AZURE_PASSWORD
+ - AZURE_CLOUD_ENVIRONMENT
+ - AZURE_ADFS_AUTHORITY_URL
 
 Run for Specific Host
 -----------------------
-When run for a specific host using the --host option, a resource group is 
+When run for a specific host using the --host option, a resource group is
 required. For a specific host, this script returns the following variables:
 
 {
@@ -76,7 +80,7 @@ required. For a specific host, this script returns the following variables:
     "version": "latest"
   },
   "location": "westus",
-  "mac_address": "00-0D-3A-31-2C-EC",
+  "mac_address": "00-00-5E-00-53-FE",
   "name": "object-name",
   "network_interface": "interface-name",
   "network_interface_id": "/subscriptions/subscription-id/resourceGroups/galaxy-production/providers/Microsoft.Network/networkInterfaces/object-name1",
@@ -130,6 +134,10 @@ Select hosts for specific tag key by assigning a comma separated list of tag key
 
 AZURE_TAGS=key1,key2,key3
 
+Select hosts for specific locations:
+
+AZURE_LOCATIONS=eastus,westus,eastus2
+
 Or, select hosts for specific tag key:value pairs by assigning a comma separated list key:value pairs to:
 
 AZURE_TAGS=key1:value1,key2:value2
@@ -138,11 +146,13 @@ If you don't need the powerstate, you can improve performance by turning off pow
 AZURE_INCLUDE_POWERSTATE=no
 
 azure_rm.ini
-----------------------
-As mentioned above you can control execution using environment variables or an .ini file. A sample
+------------
+As mentioned above, you can control execution using environment variables or a .ini file. A sample
 azure_rm.ini is included. The name of the .ini file is the basename of the inventory script (in this case
-'azure_rm') with a .ini extension. This provides you with the flexibility of copying and customizing this
-script and having matching .ini files. Go forth and customize your Azure inventory!
+'azure_rm') with a .ini extension. It also assumes the .ini file is alongside the script. To specify
+a different path for the .ini file, define the AZURE_INI_PATH environment variable:
+
+  export AZURE_INI_PATH=/path/to/custom.ini
 
 Powerstate:
 -----------
@@ -152,13 +162,13 @@ up. If the value is anything other than 'running', the machine is down, and will
 Examples:
 ---------
   Execute /bin/uname on all instances in the galaxy-qa resource group
-  $ ansible -i azure_rm_inventory.py galaxy-qa -m shell -a "/bin/uname -a"
+  $ ansible -i azure_rm.py galaxy-qa -m shell -a "/bin/uname -a"
 
   Use the inventory script to print instance specific information
-  $ contrib/inventory/azure_rm_inventory.py --host my_instance_host_name --pretty
+  $ contrib/inventory/azure_rm.py --host my_instance_host_name --pretty
 
   Use with a playbook
-  $ ansible-playbook -i contrib/inventory/azure_rm_inventory.py my_playbook.yml --limit galaxy-qa
+  $ ansible-playbook -i contrib/inventory/azure_rm.py my_playbook.yml --limit galaxy-qa
 
 
 Insecure Platform Warning
@@ -179,32 +189,56 @@ Version: 1.0.0
 '''
 
 import argparse
-import ConfigParser
-import json 
+import json
 import os
 import re
 import sys
+import inspect
+
+try:
+    # python2
+    import ConfigParser as cp
+except ImportError:
+    # python3
+    import configparser as cp
 
 from os.path import expanduser
+import ansible.module_utils.six.moves.urllib.parse as urlparse
 
 HAS_AZURE = True
 HAS_AZURE_EXC = None
+HAS_AZURE_CLI_CORE = True
+CLIError = None
 
 try:
+    from msrestazure.azure_active_directory import AADTokenCredentials
     from msrestazure.azure_exceptions import CloudError
+    from msrestazure.azure_active_directory import MSIAuthentication
+    from msrestazure import azure_cloud
     from azure.mgmt.compute import __version__ as azure_compute_version
     from azure.common import AzureMissingResourceHttpError, AzureHttpError
     from azure.common.credentials import ServicePrincipalCredentials, UserPassCredentials
-    from azure.mgmt.network.network_management_client import NetworkManagementClient,\
-                                                             NetworkManagementClientConfiguration
-    from azure.mgmt.resource.resources.resource_management_client import ResourceManagementClient,\
-                                                                         ResourceManagementClientConfiguration
-    from azure.mgmt.compute.compute_management_client import ComputeManagementClient,\
-                                                             ComputeManagementClientConfiguration
+    from azure.mgmt.network import NetworkManagementClient
+    from azure.mgmt.resource.resources import ResourceManagementClient
+    from azure.mgmt.resource.subscriptions import SubscriptionClient
+    from azure.mgmt.compute import ComputeManagementClient
+    from adal.authentication_context import AuthenticationContext
 except ImportError as exc:
     HAS_AZURE_EXC = exc
     HAS_AZURE = False
 
+try:
+    from azure.cli.core.util import CLIError
+    from azure.common.credentials import get_azure_cli_credentials, get_cli_profile
+    from azure.common.cloud import get_cli_active_cloud
+except ImportError:
+    HAS_AZURE_CLI_CORE = False
+    CLIError = Exception
+
+try:
+    from ansible.release import __version__ as ansible_version
+except ImportError:
+    ansible_version = 'unknown'
 
 AZURE_CREDENTIAL_ENV_MAPPING = dict(
     profile='AZURE_PROFILE',
@@ -213,20 +247,26 @@ AZURE_CREDENTIAL_ENV_MAPPING = dict(
     secret='AZURE_SECRET',
     tenant='AZURE_TENANT',
     ad_user='AZURE_AD_USER',
-    password='AZURE_PASSWORD'
+    password='AZURE_PASSWORD',
+    cloud_environment='AZURE_CLOUD_ENVIRONMENT',
+    adfs_authority_url='AZURE_ADFS_AUTHORITY_URL'
 )
 
 AZURE_CONFIG_SETTINGS = dict(
     resource_groups='AZURE_RESOURCE_GROUPS',
     tags='AZURE_TAGS',
+    locations='AZURE_LOCATIONS',
     include_powerstate='AZURE_INCLUDE_POWERSTATE',
     group_by_resource_group='AZURE_GROUP_BY_RESOURCE_GROUP',
     group_by_location='AZURE_GROUP_BY_LOCATION',
     group_by_security_group='AZURE_GROUP_BY_SECURITY_GROUP',
-    group_by_tag='AZURE_GROUP_BY_TAG'
+    group_by_tag='AZURE_GROUP_BY_TAG',
+    group_by_os_family='AZURE_GROUP_BY_OS_FAMILY',
+    use_private_ip='AZURE_USE_PRIVATE_IP'
 )
 
-AZURE_MIN_VERSION = "2016-03-30"
+AZURE_MIN_VERSION = "2.0.0"
+ANSIBLE_USER_AGENT = 'Ansible/{0}'.format(ansible_version)
 
 
 def azure_id_to_dict(id):
@@ -243,9 +283,12 @@ class AzureRM(object):
 
     def __init__(self, args):
         self._args = args
+        self._cloud_environment = None
         self._compute_client = None
         self._resource_client = None
         self._network_client = None
+        self._adfs_authority_url = None
+        self._resource = None
 
         self.debug = False
         if args.debug:
@@ -256,26 +299,81 @@ class AzureRM(object):
             self.fail("Failed to get credentials. Either pass as parameters, set environment variables, "
                       "or define a profile in ~/.azure/credentials.")
 
+        # if cloud_environment specified, look up/build Cloud object
+        raw_cloud_env = self.credentials.get('cloud_environment')
+        if not raw_cloud_env:
+            self._cloud_environment = azure_cloud.AZURE_PUBLIC_CLOUD  # SDK default
+        else:
+            # try to look up "well-known" values via the name attribute on azure_cloud members
+            all_clouds = [x[1] for x in inspect.getmembers(azure_cloud) if isinstance(x[1], azure_cloud.Cloud)]
+            matched_clouds = [x for x in all_clouds if x.name == raw_cloud_env]
+            if len(matched_clouds) == 1:
+                self._cloud_environment = matched_clouds[0]
+            elif len(matched_clouds) > 1:
+                self.fail("Azure SDK failure: more than one cloud matched for cloud_environment name '{0}'".format(raw_cloud_env))
+            else:
+                if not urlparse.urlparse(raw_cloud_env).scheme:
+                    self.fail("cloud_environment must be an endpoint discovery URL or one of {0}".format([x.name for x in all_clouds]))
+                try:
+                    self._cloud_environment = azure_cloud.get_cloud_from_metadata_endpoint(raw_cloud_env)
+                except Exception as e:
+                    self.fail("cloud_environment {0} could not be resolved: {1}".format(raw_cloud_env, e.message))
+
         if self.credentials.get('subscription_id', None) is None:
             self.fail("Credentials did not include a subscription_id value.")
         self.log("setting subscription_id")
         self.subscription_id = self.credentials['subscription_id']
 
-        if self.credentials.get('client_id') is not None and \
-           self.credentials.get('secret') is not None and \
-           self.credentials.get('tenant') is not None:
+        # get authentication authority
+        # for adfs, user could pass in authority or not.
+        # for others, use default authority from cloud environment
+        if self.credentials.get('adfs_authority_url'):
+            self._adfs_authority_url = self.credentials.get('adfs_authority_url')
+        else:
+            self._adfs_authority_url = self._cloud_environment.endpoints.active_directory
+
+        # get resource from cloud environment
+        self._resource = self._cloud_environment.endpoints.active_directory_resource_id
+
+        if self.credentials.get('credentials'):
+            self.azure_credentials = self.credentials.get('credentials')
+        elif self.credentials.get('client_id') and self.credentials.get('secret') and self.credentials.get('tenant'):
             self.azure_credentials = ServicePrincipalCredentials(client_id=self.credentials['client_id'],
                                                                  secret=self.credentials['secret'],
-                                                                 tenant=self.credentials['tenant'])
+                                                                 tenant=self.credentials['tenant'],
+                                                                 cloud_environment=self._cloud_environment)
+
+        elif self.credentials.get('ad_user') is not None and \
+                self.credentials.get('password') is not None and \
+                self.credentials.get('client_id') is not None and \
+                self.credentials.get('tenant') is not None:
+
+                self.azure_credentials = self.acquire_token_with_username_password(
+                    self._adfs_authority_url,
+                    self._resource,
+                    self.credentials['ad_user'],
+                    self.credentials['password'],
+                    self.credentials['client_id'],
+                    self.credentials['tenant'])
+
         elif self.credentials.get('ad_user') is not None and self.credentials.get('password') is not None:
-            self.azure_credentials = UserPassCredentials(self.credentials['ad_user'], self.credentials['password'])
+            tenant = self.credentials.get('tenant')
+            if not tenant:
+                tenant = 'common'
+            self.azure_credentials = UserPassCredentials(self.credentials['ad_user'],
+                                                         self.credentials['password'],
+                                                         tenant=tenant,
+                                                         cloud_environment=self._cloud_environment)
+
         else:
             self.fail("Failed to authenticate with provided credentials. Some attributes were missing. "
-                      "Credentials must include client_id, secret and tenant or ad_user and password.")
+                      "Credentials must include client_id, secret and tenant or ad_user and password, or "
+                      "ad_user, password, client_id, tenant and adfs_authority_url(optional) for ADFS authentication, or "
+                      "be logged in using AzureCLI.")
 
     def log(self, msg):
         if self.debug:
-            print (msg + u'\n')
+            print(msg + u'\n')
 
     def fail(self, msg):
         raise Exception(msg)
@@ -284,7 +382,7 @@ class AzureRM(object):
         path = expanduser("~")
         path += "/.azure/credentials"
         try:
-            config = ConfigParser.ConfigParser()
+            config = cp.ConfigParser()
             config.read(path)
         except Exception as exc:
             self.fail("Failed to access {0}. Check that the file exists and you have read "
@@ -303,7 +401,7 @@ class AzureRM(object):
 
     def _get_env_credentials(self):
         env_credentials = dict()
-        for attribute, env_variable in AZURE_CREDENTIAL_ENV_MAPPING.iteritems():
+        for attribute, env_variable in AZURE_CREDENTIAL_ENV_MAPPING.items():
             env_credentials[attribute] = os.environ.get(env_variable, None)
 
         if env_credentials['profile'] is not None:
@@ -315,6 +413,32 @@ class AzureRM(object):
 
         return None
 
+    def _get_azure_cli_credentials(self):
+        credentials, subscription_id = get_azure_cli_credentials()
+        cloud_environment = get_cli_active_cloud()
+
+        cli_credentials = {
+            'credentials': credentials,
+            'subscription_id': subscription_id,
+            'cloud_environment': cloud_environment
+        }
+        return cli_credentials
+
+    def _get_msi_credentials(self, subscription_id_param=None):
+        credentials = MSIAuthentication()
+        subscription_id_param = subscription_id_param or os.environ.get(AZURE_CREDENTIAL_ENV_MAPPING['subscription_id'], None)
+        try:
+            # try to get the subscription in MSI to test whether MSI is enabled
+            subscription_client = SubscriptionClient(credentials)
+            subscription = next(subscription_client.subscriptions.list())
+            subscription_id = str(subscription.subscription_id)
+            return {
+                'credentials': credentials,
+                'subscription_id': subscription_id_param or subscription_id
+            }
+        except Exception as exc:
+            return None
+
     def _get_credentials(self, params):
         # Get authentication credentials.
         # Precedence: cmd line parameters-> environment variables-> default profile in ~/.azure/credentials.
@@ -322,7 +446,7 @@ class AzureRM(object):
         self.log('Getting credentials')
 
         arg_credentials = dict()
-        for attribute, env_variable in AZURE_CREDENTIAL_ENV_MAPPING.iteritems():
+        for attribute, env_variable in AZURE_CREDENTIAL_ENV_MAPPING.items():
             arg_credentials[attribute] = getattr(params, attribute)
 
         # try module params
@@ -332,6 +456,10 @@ class AzureRM(object):
             return credentials
 
         if arg_credentials['client_id'] is not None:
+            self.log('Received credentials from parameters.')
+            return arg_credentials
+
+        if arg_credentials['ad_user'] is not None:
             self.log('Received credentials from parameters.')
             return arg_credentials
 
@@ -347,7 +475,30 @@ class AzureRM(object):
             self.log('Retrieved default profile credentials from ~/.azure/credentials.')
             return default_credentials
 
+        msi_credentials = self._get_msi_credentials(arg_credentials.get('subscription_id'))
+        if msi_credentials:
+            self.log('Retrieved credentials from MSI.')
+            return msi_credentials
+
+        try:
+            if HAS_AZURE_CLI_CORE:
+                self.log('Retrieving credentials from AzureCLI profile')
+            cli_credentials = self._get_azure_cli_credentials()
+            return cli_credentials
+        except CLIError as ce:
+            self.log('Error getting AzureCLI profile credentials - {0}'.format(ce))
+
         return None
+
+    def acquire_token_with_username_password(self, authority, resource, username, password, client_id, tenant):
+        authority_uri = authority
+
+        if tenant is not None:
+            authority_uri = authority + '/' + tenant
+
+        context = AuthenticationContext(authority_uri)
+        token_response = context.acquire_token_with_username_password(resource, username, password, client_id)
+        return AADTokenCredentials(token_response)
 
     def _register(self, key):
         try:
@@ -356,14 +507,27 @@ class AzureRM(object):
             resource_client = self.rm_client
             resource_client.providers.register(key)
         except Exception as exc:
-            self.fail("One-time registration of {0} failed - {1}".format(key, str(exc)))
+            self.log("One-time registration of {0} failed - {1}".format(key, str(exc)))
+            self.log("You might need to register {0} using an admin account".format(key))
+            self.log(("To register a provider using the Python CLI: "
+                      "https://docs.microsoft.com/azure/azure-resource-manager/"
+                      "resource-manager-common-deployment-errors#noregisteredproviderfound"))
+
+    def get_mgmt_svc_client(self, client_type, base_url, api_version):
+        client = client_type(self.azure_credentials,
+                             self.subscription_id,
+                             base_url=base_url,
+                             api_version=api_version)
+        client.config.add_user_agent(ANSIBLE_USER_AGENT)
+        return client
 
     @property
     def network_client(self):
         self.log('Getting network client')
         if not self._network_client:
-            self._network_client = NetworkManagementClient(
-                NetworkManagementClientConfiguration(self.azure_credentials, self.subscription_id))
+            self._network_client = self.get_mgmt_svc_client(NetworkManagementClient,
+                                                            self._cloud_environment.endpoints.resource_manager,
+                                                            '2017-06-01')
             self._register('Microsoft.Network')
         return self._network_client
 
@@ -371,16 +535,18 @@ class AzureRM(object):
     def rm_client(self):
         self.log('Getting resource manager client')
         if not self._resource_client:
-            self._resource_client = ResourceManagementClient(
-                ResourceManagementClientConfiguration(self.azure_credentials, self.subscription_id))
+            self._resource_client = self.get_mgmt_svc_client(ResourceManagementClient,
+                                                             self._cloud_environment.endpoints.resource_manager,
+                                                             '2017-05-10')
         return self._resource_client
 
     @property
     def compute_client(self):
         self.log('Getting compute client')
         if not self._compute_client:
-            self._compute_client = ComputeManagementClient(
-                ComputeManagementClientConfiguration(self.azure_credentials, self.subscription_id))
+            self._compute_client = self.get_mgmt_svc_client(ComputeManagementClient,
+                                                            self._cloud_environment.endpoints.resource_manager,
+                                                            '2017-03-30')
             self._register('Microsoft.Compute')
         return self._compute_client
 
@@ -403,12 +569,15 @@ class AzureInventory(object):
 
         self.resource_groups = []
         self.tags = None
+        self.locations = None
         self.replace_dash_in_groups = False
         self.group_by_resource_group = True
         self.group_by_location = True
+        self.group_by_os_family = True
         self.group_by_security_group = True
         self.group_by_tag = True
         self.include_powerstate = True
+        self.use_private_ip = False
 
         self._inventory = dict(
             _meta=dict(
@@ -425,25 +594,28 @@ class AzureInventory(object):
         if self._args.tags:
             self.tags = self._args.tags.split(',')
 
+        if self._args.locations:
+            self.locations = self._args.locations.split(',')
+
         if self._args.no_powerstate:
             self.include_powerstate = False
 
         self.get_inventory()
-        print (self._json_format_dict(pretty=self._args.pretty))
+        print(self._json_format_dict(pretty=self._args.pretty))
         sys.exit(0)
 
     def _parse_cli_args(self):
         # Parse command line arguments
         parser = argparse.ArgumentParser(
-                description='Produce an Ansible Inventory file for an Azure subscription')
+            description='Produce an Ansible Inventory file for an Azure subscription')
         parser.add_argument('--list', action='store_true', default=True,
-                           help='List instances (default: True)')
+                            help='List instances (default: True)')
         parser.add_argument('--debug', action='store_true', default=False,
-                           help='Send debug messages to STDOUT')
+                            help='Send debug messages to STDOUT')
         parser.add_argument('--host', action='store',
-                           help='Get all information about an instance')
+                            help='Get all information about an instance')
         parser.add_argument('--pretty', action='store_true', default=False,
-                           help='Pretty print JSON output(default: False)')
+                            help='Pretty print JSON output(default: False)')
         parser.add_argument('--profile', action='store',
                             help='Azure profile contained in ~/.azure/credentials')
         parser.add_argument('--subscription_id', action='store',
@@ -454,14 +626,20 @@ class AzureInventory(object):
                             help='Azure Client Secret')
         parser.add_argument('--tenant', action='store',
                             help='Azure Tenant Id')
-        parser.add_argument('--ad-user', action='store',
+        parser.add_argument('--ad_user', action='store',
                             help='Active Directory User')
         parser.add_argument('--password', action='store',
                             help='password')
+        parser.add_argument('--adfs_authority_url', action='store',
+                            help='Azure ADFS authority url')
+        parser.add_argument('--cloud_environment', action='store',
+                            help='Azure Cloud Environment name or metadata discovery URL')
         parser.add_argument('--resource-groups', action='store',
                             help='Return inventory for comma separated list of resource group names')
         parser.add_argument('--tags', action='store',
                             help='Return inventory for comma separated list of tag key:value pairs')
+        parser.add_argument('--locations', action='store',
+                            help='Return inventory for comma separated list of locations')
         parser.add_argument('--no-powerstate', action='store_true', default=False,
                             help='Do not include the power state of each virtual host')
         return parser.parse_args()
@@ -471,10 +649,9 @@ class AzureInventory(object):
             # get VMs for requested resource groups
             for resource_group in self.resource_groups:
                 try:
-                    virtual_machines = self._compute_client.virtual_machines.list(resource_group)
+                    virtual_machines = self._compute_client.virtual_machines.list(resource_group.lower())
                 except Exception as exc:
-                    sys.exit("Error: fetching virtual machines for resource group {0} - {1}".format(resource_group,
-                                                                                                   str(exc)))
+                    sys.exit("Error: fetching virtual machines for resource group {0} - {1}".format(resource_group, str(exc)))
                 if self._args.host or self.tags:
                     selected_machines = self._selected_machines(virtual_machines)
                     self._load_machines(selected_machines)
@@ -487,7 +664,7 @@ class AzureInventory(object):
             except Exception as exc:
                 sys.exit("Error: fetching virtual machines - {0}".format(str(exc)))
 
-            if self._args.host or self.tags > 0:
+            if self._args.host or self.tags or self.locations:
                 selected_machines = self._selected_machines(virtual_machines)
                 self._load_machines(selected_machines)
             else:
@@ -497,7 +674,7 @@ class AzureInventory(object):
         for machine in machines:
             id_dict = azure_id_to_dict(machine.id)
 
-            #TODO - The API is returning an ID value containing resource group name in ALL CAPS. If/when it gets
+            # TODO - The API is returning an ID value containing resource group name in ALL CAPS. If/when it gets
             #       fixed, we should remove the .lower(). Opened Issue
             #       #574: https://github.com/Azure/azure-sdk-for-python/issues/574
             resource_group = id_dict['resourceGroups'].lower()
@@ -524,14 +701,14 @@ class AzureInventory(object):
                 resource_group=resource_group,
                 mac_address=None,
                 plan=(machine.plan.name if machine.plan else None),
-                virtual_machine_size=machine.hardware_profile.vm_size.value,
-                computer_name=machine.os_profile.computer_name,
+                virtual_machine_size=machine.hardware_profile.vm_size,
+                computer_name=(machine.os_profile.computer_name if machine.os_profile else None),
                 provisioning_state=machine.provisioning_state,
             )
 
             host_vars['os_disk'] = dict(
                 name=machine.storage_profile.os_disk.name,
-                operating_system_type=machine.storage_profile.os_disk.os_type.value
+                operating_system_type=machine.storage_profile.os_disk.os_type.value.lower()
             )
 
             if self.include_powerstate:
@@ -546,7 +723,8 @@ class AzureInventory(object):
                 )
 
             # Add windows details
-            if machine.os_profile.windows_configuration is not None:
+            if machine.os_profile is not None and machine.os_profile.windows_configuration is not None:
+                host_vars['ansible_connection'] = 'winrm'
                 host_vars['windows_auto_updates_enabled'] = \
                     machine.os_profile.windows_configuration.enable_automatic_updates
                 host_vars['windows_timezone'] = machine.os_profile.windows_configuration.time_zone
@@ -556,7 +734,7 @@ class AzureInventory(object):
                     if machine.os_profile.windows_configuration.win_rm.listeners is not None:
                         host_vars['windows_rm']['listeners'] = []
                         for listener in machine.os_profile.windows_configuration.win_rm.listeners:
-                            host_vars['windows_rm']['listeners'].append(dict(protocol=listener.protocol,
+                            host_vars['windows_rm']['listeners'].append(dict(protocol=listener.protocol.name,
                                                                              certificate_url=listener.certificate_url))
 
             for interface in machine.network_profile.network_interfaces:
@@ -576,16 +754,19 @@ class AzureInventory(object):
                     host_vars['mac_address'] = network_interface.mac_address
                     for ip_config in network_interface.ip_configurations:
                         host_vars['private_ip'] = ip_config.private_ip_address
-                        host_vars['private_ip_alloc_method'] = ip_config.private_ip_allocation_method.value
+                        host_vars['private_ip_alloc_method'] = ip_config.private_ip_allocation_method
+                        if self.use_private_ip:
+                            host_vars['ansible_host'] = ip_config.private_ip_address
                         if ip_config.public_ip_address:
                             public_ip_reference = self._parse_ref_id(ip_config.public_ip_address.id)
                             public_ip_address = self._network_client.public_ip_addresses.get(
                                 public_ip_reference['resourceGroups'],
                                 public_ip_reference['publicIPAddresses'])
-                            host_vars['ansible_host'] = public_ip_address.ip_address
+                            if not self.use_private_ip:
+                                host_vars['ansible_host'] = public_ip_address.ip_address
                             host_vars['public_ip'] = public_ip_address.ip_address
                             host_vars['public_ip_name'] = public_ip_address.name
-                            host_vars['public_ip_alloc_method'] = public_ip_address.public_ip_allocation_method.value
+                            host_vars['public_ip_alloc_method'] = public_ip_address.public_ip_allocation_method
                             host_vars['public_ip_id'] = public_ip_address.id
                             if public_ip_address.dns_settings:
                                 host_vars['fqdn'] = public_ip_address.dns_settings.fqdn
@@ -598,6 +779,8 @@ class AzureInventory(object):
             if self._args.host and self._args.host == machine.name:
                 selected_machines.append(machine)
             if self.tags and self._tags_match(machine.tags, self.tags):
+                selected_machines.append(machine)
+            if self.locations and machine.location in self.locations:
                 selected_machines.append(machine)
         return selected_machines
 
@@ -630,9 +813,15 @@ class AzureInventory(object):
 
         host_name = self._to_safe(vars['name'])
         resource_group = self._to_safe(vars['resource_group'])
+        operating_system_type = self._to_safe(vars['os_disk']['operating_system_type'].lower())
         security_group = None
         if vars.get('security_group'):
             security_group = self._to_safe(vars['security_group'])
+
+        if self.group_by_os_family:
+            if not self._inventory.get(operating_system_type):
+                self._inventory[operating_system_type] = []
+            self._inventory[operating_system_type].append(host_name)
 
         if self.group_by_resource_group:
             if not self._inventory.get(resource_group):
@@ -653,7 +842,7 @@ class AzureInventory(object):
         self._inventory['azure'].append(host_name)
 
         if self.group_by_tag and vars.get('tags'):
-            for key, value in vars['tags'].iteritems():
+            for key, value in vars['tags'].items():
                 safe_key = self._to_safe(key)
                 safe_value = safe_key + '_' + self._to_safe(value)
                 if not self._inventory.get(safe_key):
@@ -676,17 +865,17 @@ class AzureInventory(object):
         file_settings = self._load_settings()
         if file_settings:
             for key in AZURE_CONFIG_SETTINGS:
-                if key in ('resource_groups', 'tags') and file_settings.get(key, None) is not None:
+                if key in ('resource_groups', 'tags', 'locations') and file_settings.get(key):
                     values = file_settings.get(key).split(',')
                     if len(values) > 0:
                         setattr(self, key, values)
-                elif file_settings.get(key, None) is not None:
+                elif file_settings.get(key):
                     val = self._to_boolean(file_settings[key])
                     setattr(self, key, val)
         else:
             env_settings = self._get_env_settings()
             for key in AZURE_CONFIG_SETTINGS:
-                if key in('resource_groups', 'tags') and env_settings.get(key, None) is not None:
+                if key in('resource_groups', 'tags', 'locations') and env_settings.get(key):
                     values = env_settings.get(key).split(',')
                     if len(values) > 0:
                         setattr(self, key, values)
@@ -713,17 +902,18 @@ class AzureInventory(object):
 
     def _get_env_settings(self):
         env_settings = dict()
-        for attribute, env_variable in AZURE_CONFIG_SETTINGS.iteritems():
+        for attribute, env_variable in AZURE_CONFIG_SETTINGS.items():
             env_settings[attribute] = os.environ.get(env_variable, None)
         return env_settings
 
     def _load_settings(self):
         basename = os.path.splitext(os.path.basename(__file__))[0]
-        path = basename + '.ini'
+        default_path = os.path.join(os.path.dirname(__file__), (basename + '.ini'))
+        path = os.path.expanduser(os.path.expandvars(os.environ.get('AZURE_INI_PATH', default_path)))
         config = None
         settings = None
         try:
-            config = ConfigParser.ConfigParser()
+            config = cp.ConfigParser()
             config.read(path)
         except:
             pass
@@ -766,21 +956,18 @@ class AzureInventory(object):
 
     def _to_safe(self, word):
         ''' Converts 'bad' characters in a string to underscores so they can be used as Ansible groups '''
-        regex = "[^A-Za-z0-9\_"
+        regex = r"[^A-Za-z0-9\_"
         if not self.replace_dash_in_groups:
-            regex += "\-"
+            regex += r"\-"
         return re.sub(regex + "]", "_", word)
 
 
 def main():
     if not HAS_AZURE:
-        sys.exit("The Azure python sdk is not installed (try 'pip install azure') - {0}".format(HAS_AZURE_EXC))
-
-    if azure_compute_version < AZURE_MIN_VERSION:
-        sys.exit("Expecting azure.mgmt.compute.__version__ to be >= {0}. Found version {1} "
-                 "Do you have Azure >= 2.0.0rc2 installed?".format(AZURE_MIN_VERSION, azure_compute_version))
+        sys.exit("The Azure python sdk is not installed (try `pip install 'azure>={0}' --upgrade`) - {1}".format(AZURE_MIN_VERSION, HAS_AZURE_EXC))
 
     AzureInventory()
+
 
 if __name__ == '__main__':
     main()
